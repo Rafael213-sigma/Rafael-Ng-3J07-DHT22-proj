@@ -33,6 +33,7 @@ int currentWifiIndex = 0;
 #define BTN_TEMP      2
 #define BTN_HUM       3
 #define BUZZER_PIN    7
+#define BATTERY_PIN   8  // ADC pin for battery voltage
 
 // --- Sensor & Display Setup ---
 #define DHTTYPE DHT22
@@ -49,6 +50,17 @@ WebServer server(80);
 float temperature = 0.0;
 float humidity = 0.0;
 bool oledOk = false;
+
+// Battery monitoring
+float batteryVoltage = 0.0;
+int batteryPercent = 0;
+#define BATTERY_DIVIDER_RATIO 1.5  // 100k + 200k divider = 1.5x
+#define BATTERY_LOW_VOLTAGE 3.2    // Low battery threshold
+#define BATTERY_MIN_VOLTAGE 3.0    // Empty battery
+#define BATTERY_MAX_VOLTAGE 4.2    // Full battery
+bool lowBatteryAlarmActive = false;
+unsigned long lastLowBattBeep = 0;
+#define LOW_BATT_BEEP_INTERVAL 5000  // Beep every 5 seconds for low battery
 
 // Volume & Buzzer
 int volume = 50;  // 0-100
@@ -100,7 +112,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     .sc .l{font-size:.8rem;color:#fff;text-transform:uppercase;letter-spacing:2px}
     .sc .v{font-size:2.5rem;font-weight:700;margin:10px 0}
     .sc .u{font-size:1rem;color:#fff}
-    .tv{color:#ff6b6b}.hv{color:#4ecdc4}.uv{color:#a29bfe;font-size:1.8rem!important}
+    .tv{color:#ff6b6b}.hv{color:#4ecdc4}.uv{color:#a29bfe;font-size:1.8rem!important}.bv{color:#ffd93d;font-size:1.8rem!important}
     .cc{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:20px;margin:15px 0}
     .cc h3{color:#fff;font-size:.85rem;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
     .cc .info{display:flex;justify-content:space-between;color:#fff;font-size:.75rem;margin-bottom:10px}
@@ -132,6 +144,11 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
         <div class="l">Uptime</div>
         <div class="v uv" id="uptime">00:00:00</div>
         <div class="u" id="ulabel">HH:MM:SS</div>
+      </div>
+      <div class="sc">
+        <div class="l">Battery</div>
+        <div class="v bv" id="batt">--</div>
+        <div class="u" id="battinfo">--</div>
       </div>
     </div>
     <div class="cc">
@@ -252,6 +269,11 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
         document.getElementById('hum').innerText=d.humidity.toFixed(1);
         document.getElementById('uptime').innerText=fmt(d.uptime);
         document.getElementById('ulabel').innerText=d.uptime>86400000?'days':'HH:MM:SS';
+        document.getElementById('batt').innerText=d.battery+'%';
+        document.getElementById('battinfo').innerText=d.battV+'V';
+        if(d.battery<20)document.getElementById('batt').style.color='#ff4757';
+        else if(d.battery<50)document.getElementById('batt').style.color='#ffa502';
+        else document.getElementById('batt').style.color='#ffd93d';
         document.getElementById('lut').innerText=new Date().toLocaleTimeString();
         document.getElementById('dot').className='sd on';
         document.getElementById('stxt').innerText='Connected';
@@ -278,7 +300,9 @@ void handleRoot() {
 void handleData() {
   String json = "{\"temperature\":" + String(temperature, 2) + 
                 ",\"humidity\":" + String(humidity, 2) + 
-                ",\"uptime\":" + String(millis()) + "}";
+                ",\"uptime\":" + String(millis()) + 
+                ",\"battery\":" + String(batteryPercent) +
+                ",\"battV\":" + String(batteryVoltage, 2) + "}";
   server.send(200, "application/json", json);
 }
 
@@ -312,6 +336,22 @@ void buzzerAlarm() {
     buzzerTone(1000, 100);
     delay(50);
   }
+}
+
+// --- Battery Functions ---
+float readBatteryVoltage() {
+  int raw = analogRead(BATTERY_PIN);
+  // ESP32-C3 ADC: 12-bit (0-4095), reference ~3.3V
+  float voltage = (raw / 4095.0) * 3.3 * BATTERY_DIVIDER_RATIO;
+  return voltage;
+}
+
+int getBatteryPercent(float voltage) {
+  if (voltage >= BATTERY_MAX_VOLTAGE) return 100;
+  if (voltage <= BATTERY_MIN_VOLTAGE) return 0;
+  // Linear approximation for 18650
+  int percent = (int)((voltage - BATTERY_MIN_VOLTAGE) / (BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE) * 100);
+  return constrain(percent, 0, 100);
 }
 
 // --- OLED Graph Drawing ---
@@ -417,6 +457,10 @@ void setup() {
   pinMode(BTN_VOL_DOWN, INPUT_PULLUP);
   pinMode(BTN_TEMP, INPUT_PULLUP);
   pinMode(BTN_HUM, INPUT_PULLUP);
+  
+  // Initialize Battery ADC
+  analogReadResolution(12);
+  pinMode(BATTERY_PIN, INPUT);
   
   // Initialize Buzzer PWM
   ledcAttach(BUZZER_PIN, 5000, 8);  // 5kHz, 8-bit resolution
@@ -559,6 +603,25 @@ void loop() {
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
 
+    // Read battery
+    batteryVoltage = readBatteryVoltage();
+    batteryPercent = getBatteryPercent(batteryVoltage);
+    
+    // Low battery alarm
+    if (batteryVoltage < BATTERY_LOW_VOLTAGE && batteryVoltage > 2.5) {
+      if (!lowBatteryAlarmActive || millis() - lastLowBattBeep > LOW_BATT_BEEP_INTERVAL) {
+        lowBatteryAlarmActive = true;
+        lastLowBattBeep = millis();
+        buzzerTone(800, 100);
+        delay(50);
+        buzzerTone(600, 100);
+        delay(50);
+        buzzerTone(400, 150);
+      }
+    } else {
+      lowBatteryAlarmActive = false;
+    }
+
     // Read values
     float newTemp = dht.readTemperature();
     float newHum = dht.readHumidity();
@@ -595,6 +658,12 @@ void loop() {
             display.setCursor(0, 0);
             display.print("IP: ");
             display.println(WiFi.localIP());
+            
+            // Battery indicator top right
+            display.setCursor(100, 0);
+            display.print(batteryPercent);
+            display.print("%");
+            
             display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
             
             display.setCursor(0, 16);
