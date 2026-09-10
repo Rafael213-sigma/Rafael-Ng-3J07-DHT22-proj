@@ -3,7 +3,10 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_ST7789.h>
+#include <SPI.h>
 #include <DHT.h>
+#include <time.h>
 
 // --- Wi-Fi Credentials (add as many as needed) ---
 struct WiFiNetwork {
@@ -32,8 +35,20 @@ int currentWifiIndex = 0;
 #define BTN_VOL_DOWN  1
 #define BTN_TEMP      2
 #define BTN_HUM       3
+#define BTN_BATT      10  // Battery display button
 #define BUZZER_PIN    7
-#define BATTERY_PIN   8  // ADC pin for battery voltage
+#define BATTERY_PIN   8   // ADC pin for battery voltage
+
+// --- ST7789V2 Display Pins (new display - set to false when not connected) ---
+#define USE_TFT false  // Set to true when ST7789 is connected
+#define TFT_SCK       9
+#define TFT_MOSI      11
+#define TFT_RST       12
+#define TFT_DC        13
+#define TFT_CS        14
+#define TFT_BL        15
+#define TFT_WIDTH     240
+#define TFT_HEIGHT    320
 
 // --- Sensor & Display Setup ---
 #define DHTTYPE DHT22
@@ -44,16 +59,21 @@ int currentWifiIndex = 0;
 
 DHT dht(DHTPIN, DHTTYPE);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 WebServer server(80);
 
 // Global variables for sensor data
 float temperature = 0.0;
 float humidity = 0.0;
 bool oledOk = false;
+bool tftOk = false;  // ST7789 display connected flag
 
 // Battery monitoring
 float batteryVoltage = 0.0;
 int batteryPercent = 0;
+float prevBatteryVoltage = 0.0;
+bool isCharging = false;
+unsigned long lastVoltageCheck = 0;
 #define BATTERY_DIVIDER_RATIO 1.5  // 100k + 200k divider = 1.5x
 #define BATTERY_LOW_VOLTAGE 3.2    // Low battery threshold
 #define BATTERY_MIN_VOLTAGE 3.0    // Empty battery
@@ -61,6 +81,12 @@ int batteryPercent = 0;
 bool lowBatteryAlarmActive = false;
 unsigned long lastLowBattBeep = 0;
 #define LOW_BATT_BEEP_INTERVAL 5000  // Beep every 5 seconds for low battery
+
+// NTP Time Configuration
+#define NTP_SERVER "pool.ntp.org"
+#define GMT_OFFSET_SEC 28800   // GMT+8 (Philippines/China/Singapore) - change to your timezone
+#define DAYLIGHT_OFFSET_SEC 0
+bool timeSynced = false;
 
 // Volume & Buzzer
 int volume = 50;  // 0-100
@@ -73,7 +99,7 @@ unsigned long lastAlarmBeep = 0;
 #define ALARM_BEEP_INTERVAL 2000  // Beep every 2 seconds
 
 // Display modes
-enum DisplayMode { MODE_NORMAL, MODE_TEMP_GRAPH, MODE_HUM_GRAPH };
+enum DisplayMode { MODE_NORMAL, MODE_TEMP_GRAPH, MODE_HUM_GRAPH, MODE_BATTERY };
 DisplayMode displayMode = MODE_NORMAL;
 
 // History for OLED graphs (stores up to 1 hour of data at 1s intervals)
@@ -84,7 +110,7 @@ int historyIndex = 0;
 bool historyFull = false;
 
 // Button debounce
-unsigned long lastBtnPress[4] = {0, 0, 0, 0};
+unsigned long lastBtnPress[5] = {0, 0, 0, 0, 0};
 #define DEBOUNCE_MS 250
 
 // Non-blocking timer variables
@@ -128,6 +154,9 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     <header>
       <h1>ESP32-C3 Live Dashboard</h1>
       <p>Environmental Monitoring System</p>
+      <div id="datetime" style="font-size:1.2rem;margin-top:10px;color:#4ecdc4">
+        <span id="day">---</span>, <span id="date">---</span> &bull; <span id="time">--:--:--</span>
+      </div>
     </header>
     <div class="sr">
       <div class="sc">
@@ -270,10 +299,14 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
         document.getElementById('uptime').innerText=fmt(d.uptime);
         document.getElementById('ulabel').innerText=d.uptime>86400000?'days':'HH:MM:SS';
         document.getElementById('batt').innerText=d.battery+'%';
-        document.getElementById('battinfo').innerText=d.battV+'V';
-        if(d.battery<20)document.getElementById('batt').style.color='#ff4757';
+        document.getElementById('battinfo').innerText=d.charging?'CHARGING':d.battV+'V';
+        if(d.charging)document.getElementById('batt').style.color='#00ff88';
+        else if(d.battery<20)document.getElementById('batt').style.color='#ff4757';
         else if(d.battery<50)document.getElementById('batt').style.color='#ffa502';
         else document.getElementById('batt').style.color='#ffd93d';
+        document.getElementById('time').innerText=d.time;
+        document.getElementById('date').innerText=d.date;
+        document.getElementById('day').innerText=d.day;
         document.getElementById('lut').innerText=new Date().toLocaleTimeString();
         document.getElementById('dot').className='sd on';
         document.getElementById('stxt').innerText='Connected';
@@ -298,11 +331,28 @@ void handleRoot() {
 }
 
 void handleData() {
+  struct tm timeinfo;
+  char timeStr[20] = "--:--";
+  char dateStr[30] = "--/--/----";
+  char dayStr[10] = "---";
+  
+  if (getLocalTime(&timeinfo, 100)) {
+    const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    sprintf(timeStr, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    sprintf(dateStr, "%s %d, %d", months[timeinfo.tm_mon], timeinfo.tm_mday, timeinfo.tm_year + 1900);
+    strcpy(dayStr, days[timeinfo.tm_wday]);
+  }
+  
   String json = "{\"temperature\":" + String(temperature, 2) + 
                 ",\"humidity\":" + String(humidity, 2) + 
                 ",\"uptime\":" + String(millis()) + 
                 ",\"battery\":" + String(batteryPercent) +
-                ",\"battV\":" + String(batteryVoltage, 2) + "}";
+                ",\"battV\":" + String(batteryVoltage, 2) +
+                ",\"charging\":" + String(isCharging ? "true" : "false") +
+                ",\"time\":\"" + timeStr + "\"" +
+                ",\"date\":\"" + dateStr + "\"" +
+                ",\"day\":\"" + dayStr + "\"}";
   server.send(200, "application/json", json);
 }
 
@@ -447,7 +497,91 @@ void handleButtons() {
     displayMode = (displayMode == MODE_HUM_GRAPH) ? MODE_NORMAL : MODE_HUM_GRAPH;
     buzzerClick();
   }
+  
+  // Battery Button - toggle battery display
+  if (digitalRead(BTN_BATT) == LOW && now - lastBtnPress[4] > DEBOUNCE_MS) {
+    lastBtnPress[4] = now;
+    displayMode = (displayMode == MODE_BATTERY) ? MODE_NORMAL : MODE_BATTERY;
+    buzzerClick();
+  }
 }
+
+// --- Update ST7789V2 Display ---
+#if USE_TFT
+void updateTFT() {
+  if (!tftOk) return;
+  
+  tft.fillScreen(ST77XX_BLACK);
+  
+  // Header
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(10, 10);
+  tft.println("ESP32-C3 Dashboard");
+  tft.drawFastHLine(0, 35, tft.width(), ST77XX_WHITE);
+  
+  // Temperature
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(10, 50);
+  tft.print("TEMPERATURE");
+  tft.setTextSize(4);
+  tft.setTextColor(ST77XX_RED);
+  tft.setCursor(10, 70);
+  tft.print(temperature, 1);
+  tft.setTextSize(2);
+  tft.print(" C");
+  
+  // Humidity
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(10, 120);
+  tft.print("HUMIDITY");
+  tft.setTextSize(4);
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(10, 140);
+  tft.print(humidity, 1);
+  tft.setTextSize(2);
+  tft.print(" %");
+  
+  // Battery
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(10, 190);
+  tft.print("BATTERY");
+  tft.setTextSize(3);
+  if (isCharging) {
+    tft.setTextColor(ST77XX_GREEN);
+  } else if (batteryPercent > 50) {
+    tft.setTextColor(ST77XX_YELLOW);
+  } else if (batteryPercent > 20) {
+    tft.setTextColor(ST77XX_ORANGE);
+  } else {
+    tft.setTextColor(ST77XX_RED);
+  }
+  tft.setCursor(10, 210);
+  tft.print(batteryPercent);
+  tft.print("%");
+  tft.setTextSize(1);
+  tft.setCursor(120, 210);
+  tft.print(batteryVoltage, 2);
+  tft.print("V");
+  
+  if (isCharging) {
+    tft.setCursor(120, 230);
+    tft.setTextColor(ST77XX_GREEN);
+    tft.print("CHARGING");
+  }
+  
+  // Status bar at bottom
+  tft.drawFastHLine(0, tft.height() - 20, tft.width(), ST77XX_WHITE);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(10, tft.height() - 15);
+  tft.print("IP: ");
+  tft.print(WiFi.localIP());
+}
+#endif
 
 void setup() {
   Serial.begin(115200);
@@ -457,6 +591,7 @@ void setup() {
   pinMode(BTN_VOL_DOWN, INPUT_PULLUP);
   pinMode(BTN_TEMP, INPUT_PULLUP);
   pinMode(BTN_HUM, INPUT_PULLUP);
+  pinMode(BTN_BATT, INPUT_PULLUP);
   
   // Initialize Battery ADC
   analogReadResolution(12);
@@ -508,6 +643,25 @@ void setup() {
     display.println("Connecting Wi-Fi...");
     display.display();
   }
+
+  // Initialize ST7789V2 Display (if enabled and connected)
+  #if USE_TFT
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  tft.init(TFT_WIDTH, TFT_HEIGHT);
+  tft.setRotation(1);
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.println("ST7789 Ready");
+  tft.setTextSize(1);
+  tft.println("Waiting for data...");
+  tftOk = true;
+  Serial.println("ST7789V2 display initialized");
+  #else
+  Serial.println("ST7789V2 disabled (set USE_TFT to true when connected)");
+  #endif
 
   // Connect to Wi-Fi - try each network in the list
   WiFi.mode(WIFI_STA);
@@ -574,6 +728,19 @@ void setup() {
   Serial.println("HTTP server started");
   Serial.print("Open: http://");
   Serial.println(WiFi.localIP());
+  
+  // Sync time via NTP
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Syncing time...");
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 5000)) {
+      timeSynced = true;
+      Serial.println(&timeinfo, "Time synced: %A, %B %d %Y %H:%M:%S");
+    } else {
+      Serial.println("Time sync failed");
+    }
+  }
 }
 
 void loop() {
@@ -581,9 +748,12 @@ void loop() {
   handleButtons();
   
   // Auto-retry Wi-Fi if disconnected (cycle through networks)
+  static bool wasConnected = false;
   wl_status_t wifiStatus = WiFi.status();
+  
   if (wifiStatus == WL_DISCONNECTED || wifiStatus == WL_CONNECT_FAILED || 
       wifiStatus == WL_CONNECTION_LOST || wifiStatus == WL_NO_SSID_AVAIL) {
+    wasConnected = false;
     static unsigned long lastRetry = 0;
     if (millis() - lastRetry > 15000) {
       lastRetry = millis();
@@ -592,6 +762,18 @@ void loop() {
       Serial.println(wifiList[currentWifiIndex].ssid);
       resetWiFi();
       WiFi.begin(wifiList[currentWifiIndex].ssid, wifiList[currentWifiIndex].password);
+    }
+  }
+  
+  // Sync time when WiFi reconnects
+  if (wifiStatus == WL_CONNECTED && !wasConnected) {
+    wasConnected = true;
+    Serial.println("WiFi connected, syncing time...");
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 5000)) {
+      timeSynced = true;
+      Serial.println(&timeinfo, "Time synced: %H:%M:%S");
     }
   }
 
@@ -606,6 +788,21 @@ void loop() {
     // Read battery
     batteryVoltage = readBatteryVoltage();
     batteryPercent = getBatteryPercent(batteryVoltage);
+    
+    // Detect charging (voltage increasing over time)
+    if (millis() - lastVoltageCheck > 10000) {  // Check every 10 seconds
+      if (batteryVoltage > prevBatteryVoltage + 0.01 && batteryVoltage > 4.0) {
+        isCharging = true;
+      } else if (batteryVoltage < prevBatteryVoltage - 0.01) {
+        isCharging = false;
+      }
+      prevBatteryVoltage = batteryVoltage;
+      lastVoltageCheck = millis();
+    }
+    // Also consider charging if voltage is very high (USB connected)
+    if (batteryVoltage > 4.15) {
+      isCharging = true;
+    }
     
     // Low battery alarm
     if (batteryVoltage < BATTERY_LOW_VOLTAGE && batteryVoltage > 2.5) {
@@ -655,25 +852,44 @@ void loop() {
           case MODE_NORMAL: {
             display.clearDisplay();
             display.setTextSize(1);
-            display.setCursor(0, 0);
-            display.print("IP: ");
-            display.println(WiFi.localIP());
             
-            // Battery indicator top right
-            display.setCursor(100, 0);
-            display.print(batteryPercent);
-            display.print("%");
-            
+            // Time and date at top
+            struct tm timeinfo;
+            if (getLocalTime(&timeinfo, 100)) {
+              const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+              display.setCursor(0, 0);
+              display.print(days[timeinfo.tm_wday]);
+              display.print(" ");
+              display.print(timeinfo.tm_mon + 1);
+              display.print("/");
+              display.print(timeinfo.tm_mday);
+              display.print("/");
+              display.print(timeinfo.tm_year - 100);  // tm_year is years since 1900
+              
+              // Time on right
+              display.setCursor(100, 0);
+              if (timeinfo.tm_hour < 10) display.print("0");
+              display.print(timeinfo.tm_hour);
+              display.print(":");
+              if (timeinfo.tm_min < 10) display.print("0");
+              display.print(timeinfo.tm_min);
+            }
             display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
             
-            display.setCursor(0, 16);
+            // IP on second line
+            display.setCursor(0, 12);
+            display.print("IP: ");
+            display.println(WiFi.localIP());
+            display.drawLine(0, 22, 128, 22, SSD1306_WHITE);
+            
+            display.setCursor(0, 26);
             display.print("Temp: ");
             display.setTextSize(2);
             display.print(temperature, 1);
             display.setTextSize(1);
             display.print("C");
             
-            display.setCursor(0, 44);
+            display.setCursor(0, 48);
             display.print("Hum:  ");
             display.setTextSize(2);
             display.print(humidity, 1);
@@ -682,10 +898,10 @@ void loop() {
             
             // Show volume overlay when button pressed
             if (millis() - volumeShowTime < VOLUME_SHOW_DURATION) {
-              display.fillRoundRect(30, 20, 68, 24, 4, SSD1306_WHITE);
+              display.fillRoundRect(30, 28, 68, 24, 4, SSD1306_WHITE);
               display.setTextColor(SSD1306_BLACK);
               display.setTextSize(2);
-              display.setCursor(38, 24);
+              display.setCursor(38, 32);
               display.print("V:");
               display.print(volume);
               display.setTextColor(SSD1306_WHITE);
@@ -726,8 +942,75 @@ void loop() {
             drawOLEDGraph(humHistory, GRAPH_HISTORY, historyFull, hMin - margin, hMax + margin, "HUM GRAPH", SSD1306_WHITE, count);
             break;
           }
+          case MODE_BATTERY: {
+            display.clearDisplay();
+            
+            // Title
+            display.setTextSize(1);
+            display.setCursor(0, 0);
+            display.print("BATTERY STATUS");
+            
+            // Charging indicator
+            if (isCharging) {
+              display.setCursor(90, 0);
+              display.print("CHRG");
+              // Flashing lightning bolt effect
+              if ((millis() / 500) % 2 == 0) {
+                display.fillTriangle(120, 0, 115, 5, 125, 5, SSD1306_WHITE);
+                display.fillTriangle(118, 5, 113, 10, 123, 10, SSD1306_WHITE);
+              }
+            }
+            
+            display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+            
+            // Percentage big text on left
+            display.setTextSize(3);
+            display.setCursor(0, 18);
+            display.print(batteryPercent);
+            display.setTextSize(2);
+            display.print("%");
+            
+            // Battery icon on right
+            display.drawRect(72, 16, 52, 24, SSD1306_WHITE);
+            display.fillRect(124, 22, 4, 12, SSD1306_WHITE);  // Battery tip
+            
+            // Fill based on percentage (animated if charging)
+            int fillWidth = (int)(batteryPercent / 100.0 * 48);
+            if (fillWidth > 0) {
+              display.fillRect(74, 18, fillWidth, 20, SSD1306_WHITE);
+            }
+            // Charging animation - blinking fill
+            if (isCharging && (millis() / 1000) % 2 == 0) {
+              display.fillRect(74, 18, 48, 20, SSD1306_WHITE);
+            }
+            
+            // Status and voltage on bottom line
+            display.setTextSize(1);
+            display.setCursor(0, 56);
+            if (isCharging) {
+              display.print("CHARGING");
+            } else if (batteryPercent > 50) {
+              display.print("GOOD");
+            } else if (batteryPercent > 20) {
+              display.print("LOW");
+            } else {
+              display.print("CRITICAL");
+            }
+            
+            display.setCursor(90, 56);
+            display.print(batteryVoltage, 2);
+            display.print("V");
+            
+            display.display();
+            break;
+          }
         }
       }
+      
+      // Update ST7789V2 display (if enabled)
+      #if USE_TFT
+      updateTFT();
+      #endif
     }
   }
 }
